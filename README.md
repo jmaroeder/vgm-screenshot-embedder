@@ -37,21 +37,3 @@ Install development dependencies:
 ```bash
 uv sync
 ```
-
-Run tests:
-
-```bash
-uv run pytest
-```
-
-Format code:
-
-```bash
-uv run black
-```
-
-Lint:
-
-```bash
-uv run ruff
-```
