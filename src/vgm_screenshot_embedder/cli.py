@@ -11,7 +11,7 @@ from vgm_screenshot_embedder.embedder import (
     get_artwork,
     has_artwork,
 )
-from vgm_screenshot_embedder.image_finder import RAWGClient
+from vgm_screenshot_embedder.image_picker import ImagePicker
 from vgm_screenshot_embedder.metadata import (
     get_game_name,
     get_song_title,
@@ -23,12 +23,12 @@ logger = logging.getLogger(__name__)
 app = typer.Typer(help="Embed VGM screenshots into audio files")
 
 
-def process_file(file_path: Path, rawg_client: RAWGClient, overwrite: bool) -> bool:
+def process_file(file_path: Path, picker: ImagePicker, overwrite: bool) -> bool:
     """Process a single audio file.
 
     Args:
         file_path: Path to audio file.
-        rawg_client: RAWG API client.
+        picker: Image picker for interactive selection.
         overwrite: Whether to overwrite existing artwork.
 
     Returns:
@@ -71,13 +71,11 @@ def process_file(file_path: Path, rawg_client: RAWGClient, overwrite: bool) -> b
         )
         return False
 
-    # Find screenshot
-    result = rawg_client.find_screenshot(game_name)
+    # Open browser and wait for user to select image
+    typer.echo(f"Opening browser for image selection: {game_name} - {song_title}")
+    result = picker.pick(game_name, song_title)
     if not result:
-        typer.echo(
-            f"[ERROR] {file_path}: No screenshot found for '{game_name}'",
-            err=True,
-        )
+        typer.echo(f"[SKIP] {file_path}: No image selected")
         return False
 
     image_data, mime_type = result
@@ -128,12 +126,6 @@ def embed(
     recursive: bool = typer.Option(
         False, "--recursive", "-r", help="Process directories recursively"
     ),
-    api_key: str | None = typer.Option(
-        None,
-        "--api-key",
-        envvar="RAWG_API_KEY",
-        help="RAWG.io API key (or set RAWG_API_KEY env var)",
-    ),
     overwrite: bool = typer.Option(
         False,
         "--overwrite",
@@ -151,8 +143,8 @@ def embed(
     """Embed game screenshots into audio files.
 
     Extracts game name from the album tag or parent directory name,
-    and song title from the title tag or filename. Finds a screenshot
-    via RAWG.io and embeds it into the audio file.
+    and song title from the title tag or filename. Opens a browser
+    for interactive image selection via Google Images.
     """
     # Configure logging: only vgm_screenshot_embedder modules at DEBUG level when verbose
     if verbose:
@@ -169,13 +161,6 @@ def embed(
         typer.echo(f"vgm-screenshot-embedder {__version__}")
         raise typer.Exit()
 
-    if not api_key:
-        typer.echo(
-            "Error: RAWG_API_KEY not provided. Use --api-key or set RAWG_API_KEY env var",
-            err=True,
-        )
-        raise typer.Exit(1)
-
     # Collect files to process
     files = walk_paths(audio_paths, recursive)
     if not files:
@@ -184,13 +169,13 @@ def embed(
 
     typer.echo(f"Processing {len(files)} file(s)...")
 
-    # Initialize RAWG client
-    rawg_client = RAWGClient(api_key)
+    # Initialize image picker
+    picker = ImagePicker()
 
     # Process each file
     success_count = 0
     for file_path in files:
-        if process_file(file_path, rawg_client, overwrite):
+        if process_file(file_path, picker, overwrite):
             success_count += 1
 
     typer.echo(
