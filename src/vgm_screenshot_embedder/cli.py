@@ -144,7 +144,7 @@ def embed(
 
     Extracts game name from the album tag or parent directory name,
     and song title from the title tag or filename. Opens a browser
-    for interactive image selection via Google Images.
+    for interactive image selection via DuckDuckGo Images.
     """
     # Configure logging: only vgm_screenshot_embedder modules at DEBUG level when verbose
     if verbose:

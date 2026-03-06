@@ -6,9 +6,10 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 import httpx
+from compression import gzip
 
 logger = logging.getLogger(__name__)
 
@@ -17,16 +18,109 @@ class ImagePickerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the image picker."""
 
     def do_GET(self) -> None:
-        """Serve the HTML page."""
+        """Serve the HTML page or proxy all other requests to DuckDuckGo."""
         if self.path == "/":
+            # Serve our custom HTML page
             html = self.server.image_picker.generate_html()
             self.send_response(200)
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
         else:
-            self.send_response(404)
+            # Proxy all other requests to DuckDuckGo
+            self._proxy_to_duckduckgo()
+
+    def _proxy_to_duckduckgo(self) -> None:
+        """Proxy a request to DuckDuckGo and return the response."""
+        # Build the target URL
+        target_url = f"https://duckduckgo.com{self.path}"
+        if self.path.startswith("?"):
+            target_url = f"https://duckduckgo.com/{self.path}"
+
+        try:
+            # Build headers to send to DuckDuckGo, forwarding most from the client request
+            headers = {}
+
+            # Headers to skip when forwarding (connection-related, host-related, etc.)
+            skip_headers = {
+                "host",
+                "connection",
+                "content-length",
+                "transfer-encoding",
+                "upgrade",
+                "proxy-connection",
+                "proxy-authenticate",
+            }
+
+            # Forward headers from the client request
+            for header_name, header_value in self.headers.items():
+                if header_name.lower() not in skip_headers:
+                    headers[header_name] = header_value
+
+            # Set/override important headers for DuckDuckGo
+            # headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            headers["Referer"] = "https://duckduckgo.com/"
+            headers["Accept-Encoding"] = "gzip"
+
+            # Fetch from DuckDuckGo
+            with httpx.Client() as client:
+                response = client.get(
+                    target_url, follow_redirects=True, timeout=10, headers=headers
+                )
+                response.raise_for_status()
+                content = response.content
+
+            # Determine content type
+            content_type = response.headers.get(
+                "content-type", "application/octet-stream"
+            )
+
+            # If HTML, inject JavaScript to detect image clicks
+            if "text/html" in content_type:
+                content_str = content.decode("utf-8", errors="ignore")
+                # Inject image click detector script before closing body
+                injection = """
+                    <script>
+                    // Detect image clicks and send to parent window
+                    document.addEventListener('click', function(e) {
+                        let target = e.target;
+                        if (target.tagName === 'IMG') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            // Try to get the full-size image URL
+                            let imageUrl = target.src || target.dataset.src;
+                            if (imageUrl) {
+                                // Resolve relative URLs
+                                if (!imageUrl.startsWith('http')) {
+                                    imageUrl = new URL(imageUrl, window.location.href).href;
+                                }
+                                window.parent.postMessage({type: 'image_selected', url: imageUrl}, '*');
+                            }
+                        }
+                    }, true);
+                    </script>
+                    """
+                # Try to inject before closing body tag
+                if "</body>" in content_str:
+                    content_str = content_str.replace("</body>", injection + "</body>")
+                else:
+                    # If no body tag, just append
+                    content_str = content_str + injection
+                content = content_str.encode("utf-8")
+
+            self.send_response(200)
+            self.send_header("Content-type", content_type)
+            self.send_header("X-Frame-Options", "ALLOWALL")
+            # Don't cache
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:
+            logger.debug(f"Proxy error for {target_url}: {e}")
+            self.send_response(502)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Proxy error: {e}".encode("utf-8"))
 
     def do_POST(self) -> None:
         """Handle /embed and /skip endpoints."""
@@ -87,7 +181,9 @@ class ImagePicker:
 
     def generate_html(self) -> str:
         """Generate the HTML page for image selection."""
-        duckduckgo_images_url = self.build_duckduckgo_images_url()
+        # Build search parameters for DuckDuckGo (everything after duckduckgo.com)
+        search_query = f"{self.game_name} screenshot {self.song_title}"
+        search_params = f"?q={quote(search_query)}&iax=images&ia=images"
 
         return f"""<!DOCTYPE html>
 <html lang="en">
@@ -101,18 +197,13 @@ class ImagePicker:
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             background: #f5f5f5;
             display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            padding: 20px;
+            flex-direction: column;
+            height: 100vh;
         }}
         .container {{
             background: white;
-            border-radius: 8px;
+            padding: 20px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-            max-width: 500px;
-            width: 100%;
-            padding: 30px;
         }}
         h1 {{
             font-size: 20px;
@@ -122,20 +213,20 @@ class ImagePicker:
         .subtitle {{
             font-size: 14px;
             color: #666;
-            margin-bottom: 24px;
+            margin-bottom: 16px;
             line-height: 1.4;
         }}
         .game-info {{
             background: #f9f9f9;
             padding: 12px;
             border-left: 4px solid #0066cc;
-            margin-bottom: 20px;
+            margin-bottom: 16px;
             border-radius: 4px;
         }}
         .game-info strong {{ display: block; margin-bottom: 4px; }}
         .game-info span {{ color: #666; font-size: 13px; }}
-        .section {{
-            margin-bottom: 20px;
+        .search-section {{
+            margin-bottom: 16px;
         }}
         .section-title {{
             font-size: 13px;
@@ -145,39 +236,15 @@ class ImagePicker:
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }}
-        button.primary {{
-            display: block;
+        .search-frame {{
             width: 100%;
-            padding: 12px;
-            background: #0066cc;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 600;
-            cursor: pointer;
-            margin-bottom: 10px;
-            transition: background 0.2s;
-        }}
-        button.primary:hover {{
-            background: #0052a3;
-        }}
-        button.primary:active {{
-            background: #003d7a;
-        }}
-        input[type="text"] {{
-            width: 100%;
-            padding: 10px;
+            height: 400px;
             border: 1px solid #ddd;
             border-radius: 4px;
-            font-size: 14px;
-            margin-bottom: 10px;
-            font-family: monospace;
+            display: none;
         }}
-        input[type="text"]:focus {{
-            outline: none;
-            border-color: #0066cc;
-            box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1);
+        .search-frame.active {{
+            display: block;
         }}
         .preview {{
             background: #f9f9f9;
@@ -208,7 +275,25 @@ class ImagePicker:
         .button-group {{
             display: flex;
             gap: 10px;
-            margin-top: 20px;
+            margin-top: 15px;
+        }}
+        button.primary {{
+            flex: 1;
+            padding: 12px;
+            background: #0066cc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }}
+        button.primary:hover {{
+            background: #0052a3;
+        }}
+        button.primary:active {{
+            background: #003d7a;
         }}
         button.secondary {{
             flex: 1;
@@ -253,23 +338,14 @@ class ImagePicker:
             <span>{self.song_title}</span>
         </div>
 
-        <div class="section">
-            <div class="section-title">Step 1: Find an image</div>
-            <button class="primary" onclick="openImageSearch()">
-                🔍 Search DuckDuckGo Images
-            </button>
+        <div class="search-section">
+            <div class="section-title">Step 1: Search and select an image</div>
+            <iframe id="searchFrame" class="search-frame active" src="/{search_params}"></iframe>
         </div>
 
-        <div class="section">
-            <div class="section-title">Step 2: Paste image URL</div>
-            <input
-                type="text"
-                id="imageUrl"
-                placeholder="https://example.com/image.jpg"
-                spellcheck="false"
-                oninput="onUrlInput()"
-            />
-            <div class="preview" id="preview">No image selected</div>
+        <div>
+            <div class="section-title">Step 2: Preview selected image</div>
+            <div class="preview" id="preview">Click an image to select it</div>
         </div>
 
         <div class="button-group">
@@ -283,94 +359,81 @@ class ImagePicker:
     </div>
 
     <script>
-        const imageSearchUrl = "{duckduckgo_images_url}";
-        let previewTimeout;
+        let selectedImageUrl = null;
 
-        function openImageSearch() {{
-            window.open(imageSearchUrl, "image_search");
-        }}
+        // Listen for image selection from the iframe
+        window.addEventListener('message', function(event) {{
+            if (event.data.type === 'image_selected') {{
+                selectedImageUrl = event.data.url;
+                const preview = document.getElementById('preview');
+                preview.className = 'preview loading';
+                preview.innerHTML = 'Loading...';
 
-        function onUrlInput() {{
-            const url = document.getElementById("imageUrl").value.trim();
-            clearTimeout(previewTimeout);
-
-            if (!url) {{
-                document.getElementById("preview").innerHTML = "No image selected";
-                document.getElementById("embedBtn").disabled = true;
-                return;
-            }}
-
-            // Debounce preview
-            previewTimeout = setTimeout(() => {{
-                const preview = document.getElementById("preview");
-                preview.className = "preview loading";
-                preview.innerHTML = "Loading...";
-
-                // Try to load image
+                // Try to load the image to verify it works
                 const img = new Image();
-                img.onload = () => {{
-                    preview.className = "preview";
-                    preview.innerHTML = "";
+                img.onload = function() {{
+                    preview.className = 'preview';
+                    preview.innerHTML = '';
                     preview.appendChild(img);
-                    document.getElementById("embedBtn").disabled = false;
+                    document.getElementById('embedBtn').disabled = false;
                 }};
-                img.onerror = () => {{
-                    preview.className = "preview error";
-                    preview.innerHTML = "⚠️ Failed to load image (bad URL or CORS issue)";
-                    document.getElementById("embedBtn").disabled = true;
+                img.onerror = function() {{
+                    preview.className = 'preview error';
+                    preview.innerHTML = '⚠️ Failed to load image';
+                    document.getElementById('embedBtn').disabled = true;
+                    selectedImageUrl = null;
                 }};
-                img.src = url;
-            }}, 300);
-        }}
+                img.src = selectedImageUrl;
+            }}
+        }});
 
         function embedImage() {{
-            const url = document.getElementById("imageUrl").value.trim();
-            if (!url) return;
+            if (!selectedImageUrl) return;
 
-            const btn = document.getElementById("embedBtn");
-            const status = document.getElementById("status");
+            const btn = document.getElementById('embedBtn');
+            const status = document.getElementById('status');
             btn.disabled = true;
-            status.textContent = "Embedding...";
-            status.className = "";
+            status.textContent = 'Embedding...';
+            status.className = '';
 
-            fetch("/embed", {{
-                method: "POST",
-                headers: {{"Content-Type": "application/json"}},
-                body: JSON.stringify({{url: url}})
+            fetch('/embed', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{url: selectedImageUrl}})
             }})
             .then(r => r.json())
             .then(data => {{
                 if (data.ok) {{
-                    status.textContent = "✓ Image embedded! Closing...";
-                    status.className = "success";
+                    status.textContent = '✓ Image embedded! Closing...';
+                    status.className = 'success';
                     setTimeout(() => window.close(), 1000);
                 }} else {{
-                    status.textContent = "✗ Error: " + (data.error || "Unknown error");
-                    status.className = "error";
+                    status.textContent = '✗ Error: ' + (data.error || 'Unknown error');
+                    status.className = 'error';
                     btn.disabled = false;
                 }}
             }})
             .catch(e => {{
-                status.textContent = "✗ Error: " + e.message;
-                status.className = "error";
+                status.textContent = '✗ Error: ' + e.message;
+                status.className = 'error';
                 btn.disabled = false;
             }});
         }}
 
         function skipFile() {{
-            const status = document.getElementById("status");
-            status.textContent = "Skipping...";
-            status.className = "";
+            const status = document.getElementById('status');
+            status.textContent = 'Skipping...';
+            status.className = '';
 
-            fetch("/skip", {{method: "POST"}})
+            fetch('/skip', {{method: 'POST'}})
             .then(() => {{
-                status.textContent = "✓ Skipped. Closing...";
-                status.className = "success";
+                status.textContent = '✓ Skipped. Closing...';
+                status.className = 'success';
                 setTimeout(() => window.close(), 1000);
             }})
             .catch(e => {{
-                status.textContent = "✗ Error: " + e.message;
-                status.className = "error";
+                status.textContent = '✗ Error: ' + e.message;
+                status.className = 'error';
             }});
         }}
     </script>
@@ -398,7 +461,9 @@ class ImagePicker:
                 image_data = response.content
 
             # Determine MIME type from Content-Type header first
-            content_type = response.headers.get("content-type", "").split(";")[0].strip()
+            content_type = (
+                response.headers.get("content-type", "").split(";")[0].strip()
+            )
             if content_type and content_type.startswith("image/"):
                 mime_type = content_type
             else:
