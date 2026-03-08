@@ -95,12 +95,15 @@ def process_file(file_path: Path, picker: ImagePicker, overwrite: bool) -> bool:
 def walk_paths(paths: list[str], recursive: bool) -> list[Path]:
     """Walk through provided paths and yield audio files.
 
+    Respects the order of paths provided on command line, but sorts files
+    lexicographically within each directory.
+
     Args:
         paths: List of file or directory paths.
         recursive: Whether to recurse into directories.
 
     Returns:
-        List of Path objects to process.
+        List of Path objects to process, in order.
     """
     files = []
 
@@ -111,11 +114,16 @@ def walk_paths(paths: list[str], recursive: bool) -> list[Path]:
             files.append(path)
         elif path.is_dir():
             if recursive:
-                files.extend(path.rglob("*"))
+                # Get all files recursively and sort them
+                dir_files = sorted(path.rglob("*"))
             else:
-                files.extend(path.iterdir())
+                # Get files from this directory and sort them
+                dir_files = sorted(path.iterdir())
 
-    return [p for p in files if p.is_file()]
+            # Filter to only files and extend
+            files.extend([p for p in dir_files if p.is_file()])
+
+    return files
 
 
 @app.command()
@@ -177,6 +185,9 @@ def embed(
     for file_path in files:
         if process_file(file_path, picker, overwrite):
             success_count += 1
+
+    # Signal to browser that processing is complete
+    picker.is_processing = False
 
     typer.echo(
         f"\nCompleted: {success_count}/{len(files)} files processed successfully"

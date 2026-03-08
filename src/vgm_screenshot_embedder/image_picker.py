@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
@@ -18,7 +18,7 @@ class ImagePickerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the image picker."""
 
     def do_GET(self) -> None:
-        """Serve the HTML page or proxy all other requests to DuckDuckGo."""
+        """Serve the HTML page, API endpoints, or proxy all other requests to DuckDuckGo."""
         if self.path == "/":
             # Serve our custom HTML page
             html = self.server.image_picker.generate_html()
@@ -26,6 +26,37 @@ class ImagePickerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(html.encode("utf-8"))
+        elif self.path == "/api/current":
+            # Return current game and song info as JSON
+            picker = self.server.image_picker
+            response = {
+                "game_name": picker.game_name,
+                "song_title": picker.song_title
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode("utf-8"))
+        elif self.path == "/api/search-url":
+            # Return the DuckDuckGo search URL for the current game (as relative path)
+            picker = self.server.image_picker
+            response = {
+                "url": picker.build_duckduckgo_search_path()
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode("utf-8"))
+        elif self.path == "/api/is-processing":
+            # Return whether the CLI is still processing files
+            picker = self.server.image_picker
+            response = {
+                "processing": picker.is_processing
+            }
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode("utf-8"))
         else:
             # Proxy all other requests to DuckDuckGo
             self._proxy_to_duckduckgo()
@@ -79,25 +110,79 @@ class ImagePickerHandler(BaseHTTPRequestHandler):
             if "text/html" in content_type:
                 content_str = content.decode("utf-8", errors="ignore")
                 # Inject image click detector script before closing body
-                injection = """
+                injection = r"""
                     <script>
-                    // Detect image clicks and send to parent window
-                    document.addEventListener('click', function(e) {
-                        let target = e.target;
-                        if (target.tagName === 'IMG') {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            // Try to get the full-size image URL
-                            let imageUrl = target.src || target.dataset.src;
-                            if (imageUrl) {
-                                // Resolve relative URLs
-                                if (!imageUrl.startsWith('http')) {
-                                    imageUrl = new URL(imageUrl, window.location.href).href;
-                                }
-                                window.parent.postMessage({type: 'image_selected', url: imageUrl}, '*');
+                    let lastAsideCount = 0;
+                    let lastSentUrl = null;
+
+                    function extractImageUrlFromAside() {
+                        const asides = document.querySelectorAll('aside');
+                        if (asides.length === 0) return;
+
+                        const aside = asides[asides.length - 1];
+
+                        // Find the currently visible image (aria-hidden="false")
+                        const visibleContainers = aside.querySelectorAll('[aria-hidden="false"]');
+                        if (visibleContainers.length === 0) return;
+
+                        const visibleContainer = visibleContainers[visibleContainers.length - 1];
+
+                        // Extract image URL from the visible container
+                        let imageUrl = extractUrlFromContainer(visibleContainer);
+
+                        // Only send if we found a URL and it's different from the last one we sent
+                        if (imageUrl && imageUrl !== lastSentUrl) {
+                            console.log('Detected new visible image, sending URL:', imageUrl);
+                            lastSentUrl = imageUrl;
+                            window.parent.postMessage({type: 'image_selected', url: imageUrl}, '*');
+                        }
+                    }
+
+                    function extractUrlFromContainer(container) {
+                        let imageUrl = null;
+
+                        // Look for the "View File" link with an image file extension
+                        const links = container.querySelectorAll('a[href]');
+                        for (const link of links) {
+                            const href = link.href;
+
+                            // Skip links to video/social sites
+                            if (href.includes('youtube.com') || href.includes('facebook.com') ||
+                                href.includes('instagram.com') || href.includes('twitter.com')) {
+                                continue;
+                            }
+
+                            // Check if it looks like an image URL
+                            if (href.match(/\.(jpg|jpeg|png|webp|gif|svg)$/i) ||
+                                href.includes('image') || href.includes('presskit')) {
+                                console.log('Found image link:', href);
+                                return href;
                             }
                         }
-                    }, true);
+
+                        // Fallback: try to extract from proxy URLs in img tags
+                        const images = container.querySelectorAll('img[src]');
+                        for (const img of images) {
+                            if (img.src && img.src.includes('external-content.duckduckgo.com')) {
+                                try {
+                                    const srcUrl = new URL(img.src);
+                                    const actualUrl = srcUrl.searchParams.get('u');
+                                    if (actualUrl) {
+                                        imageUrl = decodeURIComponent(actualUrl);
+                                        console.log('Extracted from proxy:', imageUrl);
+                                        return imageUrl;
+                                    }
+                                } catch (e) {
+                                    console.log('Error parsing proxy URL:', e);
+                                }
+                            }
+                        }
+
+                        return null;
+                    }
+
+                    // Poll frequently to detect when user navigates to different images
+                    setInterval(extractImageUrlFromAside, 200);
                     </script>
                     """
                 # Try to inject before closing body tag
@@ -176,8 +261,9 @@ class ImagePicker:
         self.event = threading.Event()
         self.game_name = ""
         self.song_title = ""
-        self.server: HTTPServer | None = None
+        self.server: ThreadingHTTPServer | None = None
         self.server_thread: threading.Thread | None = None
+        self.is_processing = True  # Set to False when CLI is done
 
     def generate_html(self) -> str:
         """Generate the HTML page for image selection."""
@@ -387,6 +473,79 @@ class ImagePicker:
             }}
         }});
 
+        function waitForNextFile() {{
+            // Poll for when the game/song info changes (next file)
+            let lastGameName = document.querySelector('.game-info strong').textContent;
+            let lastSongTitle = document.querySelector('.game-info span').textContent;
+
+            const pollInterval = setInterval(() => {{
+                fetch('/api/current')
+                    .then(r => r.json())
+                    .then(data => {{
+                        if (data.game_name !== lastGameName || data.song_title !== lastSongTitle) {{
+                            // Game/song changed - new file is ready!
+                            clearInterval(pollInterval);
+                            resetForNextFile();
+                        }}
+                    }})
+                    .catch(e => console.log('Poll error:', e));
+            }}, 500);
+        }}
+
+        function resetForNextFile() {{
+            // Check if processing is complete
+            fetch('/api/is-processing')
+                .then(r => r.json())
+                .then(data => {{
+                    if (!data.processing) {{
+                        // CLI is done - show completion message
+                        showCompletionMessage();
+                    }} else {{
+                        // More files to process - update UI without full reload
+                        // Reset state
+                        selectedImageUrl = null;
+                        lastSentUrl = null;
+                        document.getElementById('preview').innerHTML = 'Click an image to select it';
+                        document.getElementById('preview').className = 'preview';
+                        document.getElementById('embedBtn').disabled = true;
+                        document.getElementById('status').textContent = '';
+                        document.getElementById('status').className = '';
+
+                        // Fetch new game/song info and search URL
+                        Promise.all([
+                            fetch('/api/current').then(r => r.json()),
+                            fetch('/api/search-url').then(r => r.json())
+                        ])
+                        .then(([currentData, searchData]) => {{
+                            // Update game info display
+                            document.querySelector('.game-info strong').textContent = currentData.game_name;
+                            document.querySelector('.game-info span').textContent = currentData.song_title;
+
+                            // Update iframe with new search URL
+                            const iframe = document.getElementById('searchFrame');
+                            iframe.src = searchData.url;
+                        }})
+                        .catch(e => {{
+                            console.log('Error updating UI:', e);
+                            // Fallback to reload if something goes wrong
+                            window.location.reload();
+                        }});
+                    }}
+                }})
+                .catch(e => {{
+                    console.log('Error checking processing status:', e);
+                    // Assume still processing if we can't check
+                    window.location.reload();
+                }});
+        }}
+
+        function showCompletionMessage() {{
+            // Hide iframe and show completion message
+            const searchFrame = document.getElementById('searchFrame');
+            const searchSection = searchFrame.parentElement;
+            searchSection.innerHTML = '<p style="text-align: center; padding: 20px; color: #388e3c; font-size: 16px;">✓ All files processed! You can close this window.</p>';
+        }}
+
         function embedImage() {{
             if (!selectedImageUrl) return;
 
@@ -404,9 +563,10 @@ class ImagePicker:
             .then(r => r.json())
             .then(data => {{
                 if (data.ok) {{
-                    status.textContent = '✓ Image embedded! Closing...';
+                    status.textContent = '✓ Image embedded! Waiting for next file...';
                     status.className = 'success';
-                    setTimeout(() => window.close(), 1000);
+                    btn.disabled = true;
+                    waitForNextFile();
                 }} else {{
                     status.textContent = '✗ Error: ' + (data.error || 'Unknown error');
                     status.className = 'error';
@@ -427,9 +587,9 @@ class ImagePicker:
 
             fetch('/skip', {{method: 'POST'}})
             .then(() => {{
-                status.textContent = '✓ Skipped. Closing...';
+                status.textContent = '✓ Skipped! Waiting for next file...';
                 status.className = 'success';
-                setTimeout(() => window.close(), 1000);
+                waitForNextFile();
             }})
             .catch(e => {{
                 status.textContent = '✗ Error: ' + e.message;
@@ -444,6 +604,11 @@ class ImagePicker:
         """Build a DuckDuckGo Images search URL for the game/track."""
         search_query = f"{self.game_name} screenshot {self.song_title}"
         return f"https://duckduckgo.com/?q={quote(search_query)}&iax=images&ia=images"
+
+    def build_duckduckgo_search_path(self) -> str:
+        """Build a relative path for DuckDuckGo Images search (for local proxy)."""
+        search_query = f"{self.game_name} screenshot {self.song_title}"
+        return f"/?q={quote(search_query)}&iax=images&ia=images"
 
     def download_image(self, url: str) -> tuple[bytes, str] | None:
         """Download an image from a URL.
@@ -499,27 +664,24 @@ class ImagePicker:
         self.result = None
         self.event.clear()
 
-        # Start HTTP server
-        self.server = HTTPServer(("localhost", 0), ImagePickerHandler)
-        self.server.image_picker = self
-        port = self.server.server_port
+        # Start HTTP server only on first call
+        if self.server is None:
+            self.server = ThreadingHTTPServer(("localhost", 0), ImagePickerHandler)
+            self.server.image_picker = self  # type: ignore
+            port = self.server.server_port
 
-        self.server_thread = threading.Thread(
-            target=self.server.serve_forever, daemon=True
-        )
-        self.server_thread.start()
+            self.server_thread = threading.Thread(
+                target=self.server.serve_forever, daemon=True
+            )
+            self.server_thread.start()
 
-        # Open browser
-        url = f"http://localhost:{port}/"
-        logger.debug(f"Opening browser at {url}")
-        webbrowser.open(url)
+            # Open browser
+            url = f"http://localhost:{port}/"
+            print(f"Opening image picker at: {url}")
+            webbrowser.open(url)
 
         # Wait for user input
         self.event.wait()
 
-        # Shutdown server
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-
+        # Keep server running for next file - don't shutdown
         return self.result

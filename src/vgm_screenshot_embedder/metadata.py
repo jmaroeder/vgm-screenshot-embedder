@@ -1,8 +1,34 @@
 """Extract game and song metadata from audio files."""
 
+import re
 from pathlib import Path
 
 from mutagen import File, FileType
+
+
+def clean_game_name(name: str) -> str:
+    """Remove OST/soundtrack-related strings from game name.
+
+    Args:
+        name: Game name to clean.
+
+    Returns:
+        Cleaned game name.
+    """
+    # Patterns to remove (case-insensitive)
+    patterns = [
+        r'\b(?:original\s+)?sound\s*track\b',  # "sound track", "sound track", "original sound track"
+        r'\bOST\b',  # "OST"
+        r'\bsoundtrack\b',  # "soundtrack"
+    ]
+
+    result = name
+    for pattern in patterns:
+        result = re.sub(pattern, '', result, flags=re.IGNORECASE)
+
+    # Clean up extra whitespace
+    result = re.sub(r'\s+', ' ', result).strip()
+    return result
 
 
 def load_audio(path: Path) -> FileType | None:
@@ -28,6 +54,8 @@ def get_game_name(audio: FileType, path: Path) -> str | None:
     1. 'album' tag from audio metadata
     2. Parent directory name
 
+    Removes OST/soundtrack-related strings from the result.
+
     Args:
         audio: mutagen File object with easy tags.
         path: Path to audio file.
@@ -44,12 +72,16 @@ def get_game_name(audio: FileType, path: Path) -> str | None:
         if album and isinstance(album, list):
             album = album[0]
         if album and isinstance(album, str) and album.strip():
-            return album.strip()
+            cleaned = clean_game_name(album.strip())
+            if cleaned:
+                return cleaned
 
     # Fall back to parent directory name
     parent_name = path.parent.name
     if parent_name and parent_name != ".":
-        return parent_name
+        cleaned = clean_game_name(parent_name)
+        if cleaned:
+            return cleaned
 
     return None
 
